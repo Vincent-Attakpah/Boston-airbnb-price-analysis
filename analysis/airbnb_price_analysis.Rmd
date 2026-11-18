@@ -1,0 +1,1036 @@
+---
+title: "ST 552 Project: Airbnb Nightly Price Analysis with MLR"
+author: "Peter Sasu and Vincent Johnson Attakpah"
+date: "2026-11-17"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center")
+```
+
+## Load Packages and Define Helper Functions
+
+```{r load-packages}
+library(ggplot2)
+library(patchwork)
+library(car)
+library(glmnet)
+
+summary_stats <- function(x, digits = 2) {
+  x_c <- x[!is.na(x)]
+  q1  <- unname(quantile(x_c, 0.25))
+  q3  <- unname(quantile(x_c, 0.75))
+  iqr <- q3 - q1
+
+  vals <- c(N = length(x_c), Missing = sum(is.na(x)), Min = min(x_c),
+            Q1 = q1, Mean = mean(x_c), Median = median(x_c), Q3 = q3,
+            Max = max(x_c), SD = sd(x_c), IQR = iqr,
+            Outliers = sum(x_c < q1 - 1.5 * iqr | x_c > q3 + 1.5 * iqr))
+
+  data.frame(Statistic = names(vals),
+             Value = formatC(vals, format = "f", digits = digits,
+                             big.mark = ",", drop0trailing = TRUE),
+             row.names = NULL)
+}
+
+# Side-by-side histogram and boxplot for one variable
+hist_box <- function(data, var, label, fill = "lightblue", binwidth = NULL) {
+  p1 <- ggplot(data, aes(x = .data[[var]])) +
+    geom_histogram(bins = 30, binwidth = binwidth, color = "black", fill = fill) +
+    labs(title = paste("Histogram of", label), x = label, y = "Frequency") +
+    theme_minimal()
+
+  p2 <- ggplot(data, aes(y = .data[[var]])) +
+    geom_boxplot(fill = fill) +
+    labs(title = paste("Boxplot of", label), y = label) +
+    theme_minimal()
+
+  p1 + p2
+}
+```
+
+## Read the Data
+
+```{r read-data}
+# Read every column as text so listing IDs keep all their digits;
+# numeric columns are converted below
+listings <- read.csv("listings.csv", colClasses = "character",
+                     na.strings = c("", "NA"), encoding = "UTF-8")
+
+dim(listings)
+```
+
+> The raw data contain 4,368 listings and 90 variables.
+
+## Select the Variables for the Analysis
+
+The analysis uses the nightly price as the response. The main predictors from the proposal are accommodation capacity, bedrooms, bathrooms, room type and neighborhood. Additional variables that may also explain price are kept for variable selection: beds, whether the bathroom is shared, distance to downtown, minimum nights, superhost status and the number of amenities. Some of these overlap with the main predictors, which will be checked for multicollinearity.
+
+```{r select-variables}
+airbnb <- data.frame(
+  listing_id     = listings$id,
+  price          = as.numeric(gsub("[$,]", "", listings$price)),
+  accommodates   = as.numeric(listings$accommodates),
+  bedrooms       = as.numeric(listings$bedrooms),
+  beds           = as.numeric(listings$beds),
+  bathrooms_text = trimws(listings$bathrooms_text),
+  room_type      = trimws(listings$room_type),
+  neighborhood   = trimws(listings$neighbourhood_cleansed),
+  latitude       = as.numeric(listings$latitude),
+  longitude      = as.numeric(listings$longitude),
+  minimum_nights = as.numeric(listings$minimum_nights),
+  superhost      = ifelse(listings$host_is_superhost == "t", 1, 0),
+  amenities      = listings$amenities
+)
+
+head(airbnb[, c("listing_id", "price", "accommodates", "bedrooms", "beds",
+                "room_type", "neighborhood")])
+```
+
+> Price is stored as text with a dollar sign and commas (for example "$1,250.00"), so these characters are removed before converting it to a number. Superhost status is recorded as "t" or "f" and is converted to 1 (superhost) or 0.
+
+## Bathroom Counts
+
+The numeric bathroom column in the raw data is empty, so the number of bathrooms is taken from the text description, such as "1.5 shared baths".
+
+```{r bathrooms}
+table(airbnb$bathrooms_text, useNA = "ifany")
+
+bath_text <- tolower(airbnb$bathrooms_text)
+
+# Descriptions that start with a number, e.g. "2 baths", "1.5 shared baths"
+has_number <- grepl("^[0-9.]+ ", bath_text)
+
+airbnb$bathrooms <- NA
+airbnb$bathrooms[has_number] <- as.numeric(sub(" .*", "", bath_text[has_number]))
+
+# "Half-bath", "Shared half-bath" and "Private half-bath" count as 0.5
+airbnb$bathrooms[!has_number & grepl("half-bath", bath_text)] <- 0.5
+
+# Shared bathroom indicator: 1 if the description says "shared"
+airbnb$shared_bath <- ifelse(grepl("shared", bath_text), 1, 0)
+airbnb$shared_bath[is.na(bath_text)] <- NA
+
+# Check the conversion: each description and the values it was given
+bath_check <- unique(airbnb[, c("bathrooms_text", "bathrooms", "shared_bath")])
+bath_check[order(bath_check$bathrooms), ]
+```
+
+> Every description that starts with a number is given that number, and the three half-bath descriptions are given 0.5. The 33 listings described as "0 baths" or "0 shared baths" are kept with a count of 0, as reported. The bathroom count includes both shared and private bathrooms, so a separate indicator, `shared_bath`, records whether the bathroom is shared (1) or not (0). The 29 listings with no bathroom description are left missing for both.
+
+## Distance to Downtown
+
+```{r distance}
+# Straight-line distance (km) from each listing to Boston Common,
+# using the haversine formula for distances on the earth's surface
+downtown_lat <- 42.3550
+downtown_lon <- -71.0656
+
+to_rad <- pi / 180
+dlat <- (airbnb$latitude - downtown_lat) * to_rad
+dlon <- (airbnb$longitude - downtown_lon) * to_rad
+a <- sin(dlat / 2)^2 +
+  cos(airbnb$latitude * to_rad) * cos(downtown_lat * to_rad) * sin(dlon / 2)^2
+airbnb$dist_downtown <- 6371 * 2 * asin(sqrt(a))
+
+summary(airbnb$dist_downtown)
+```
+
+> Distance to downtown is measured in kilometers from each listing to Boston Common, using the listing's latitude and longitude. Distances range from 0.19 km to 14.4 km, with a median of 3.06 km. This variable gives a single continuous measure of location. It overlaps with neighborhood, since each neighborhood sits at a roughly fixed distance from downtown, and this overlap will be checked during variable selection.
+
+## Minimum Nights
+
+```{r minimum-nights}
+summary(airbnb$minimum_nights)
+
+# Long-stay indicator: 1 if the listing requires a stay of 28 nights or more
+airbnb$long_stay <- ifelse(airbnb$minimum_nights >= 28, 1, 0)
+table(airbnb$long_stay, useNA = "ifany")
+```
+
+> Most listings allow short stays (median 2 nights), but the minimum ranges up to 400 nights. Listings requiring 28 nights or more are effectively monthly rentals, and many hosts set the minimum at exactly 29 or 30 nights. These listings have much lower nightly prices: among listings with a price, the median price drops from \$236 or more for minimums under 28 nights to between \$119 and \$180 for minimums of 28 nights or more. The indicator `long_stay` is therefore added (1 = minimum of 28 nights or more). 1,817 listings in the raw data are long-stay listings, and 39 have no minimum nights recorded.
+
+## Number of Amenities
+
+```{r amenities}
+# First few amenities of the first listing
+substr(airbnb$amenities[1], 1, 70)
+
+# Amenities are stored as a list such as ["Wifi", "Kitchen", "Heating"];
+# count the items by splitting on the separator between them
+airbnb$amenities_count <- ifelse(airbnb$amenities == "[]", 0,
+                                 lengths(strsplit(airbnb$amenities, '", "',
+                                                  fixed = TRUE)))
+summary(airbnb$amenities_count)
+```
+
+> Each listing's amenities are stored as a list of text items, so the number of amenities is counted for each listing. Counts range from 0 to 93, with a median of 36.
+
+## Missing Values
+
+```{r missing}
+colSums(is.na(airbnb))
+```
+
+> Price is missing for 882 listings (about 20%). Among the predictors, beds is missing for 122 listings, minimum nights (and so `long_stay`) for 39, and the bathroom count and `shared_bath` for 29. Accommodates, bedrooms, room type, neighborhood, distance to downtown, superhost status and the number of amenities have no missing values.
+
+```{r remove-missing}
+# Keep listings with a positive price and complete information on all predictors
+airbnb <- airbnb[!is.na(airbnb$price) & airbnb$price > 0, ]
+airbnb <- airbnb[complete.cases(airbnb[, c("accommodates", "bedrooms", "beds",
+                                           "bathrooms", "shared_bath",
+                                           "room_type", "neighborhood",
+                                           "dist_downtown", "minimum_nights",
+                                           "superhost", "amenities_count")]), ]
+
+nrow(airbnb)
+```
+
+> Removing the 882 listings without a price leaves 3,486 listings, all with prices above zero. Removing the 155 of these with a missing predictor (mostly beds) leaves **3,331 listings** with complete information. 
+
+## Room Type
+
+```{r room-type}
+table(airbnb$room_type)
+
+# Combine private and shared rooms into one group
+airbnb$room_type[airbnb$room_type %in% c("Private room", "Shared room")] <-
+  "Private/shared room"
+
+airbnb$room_type <- factor(airbnb$room_type,
+                           levels = c("Entire home/apt", "Private/shared room",
+                                      "Hotel room"))
+table(airbnb$room_type)
+```
+
+> Only 4 shared rooms remain, which is too few to estimate as a separate group, so they are combined with private rooms. Both are rooms within a shared property, unlike entire homes. Room type therefore has three levels: entire home/apt (2,359 listings), private/shared room (917) and hotel room (55). Entire home/apt, the largest group, is set as the reference level.
+
+## Neighborhood
+
+```{r neighborhood}
+airbnb$neighborhood <- factor(airbnb$neighborhood)
+
+sort(table(airbnb$neighborhood), decreasing = TRUE)
+```
+
+> All 25 Boston neighborhoods remain. Dorchester has the most listings (462), followed by Downtown (273) and Back Bay (267). A few neighborhoods are small, especially Longwood Medical Area (17) and Leather District (3), so their estimated price differences will be less precise. They are kept so that every neighborhood is represented.
+
+## Log Price
+
+```{r log-price}
+airbnb$log_price <- log(airbnb$price)
+```
+
+> Nightly prices are strongly right-skewed, so the natural log of price is added as the planned response variable for the regression models.
+
+## Final Data Set
+
+```{r final-data}
+# Keep the analysis variables in a clear order
+airbnb <- airbnb[, c("listing_id", "price", "log_price",
+                     "accommodates", "bedrooms", "beds", "bathrooms",
+                     "shared_bath", "room_type", "neighborhood",
+                     "dist_downtown", "minimum_nights", "long_stay",
+                     "superhost", "amenities_count")]
+rownames(airbnb) <- NULL
+
+dim(airbnb)
+str(airbnb)
+colSums(is.na(airbnb))
+summary(airbnb[, c("price", "log_price", "accommodates", "bedrooms", "beds",
+                   "bathrooms", "dist_downtown", "minimum_nights",
+                   "amenities_count")])
+```
+
+> The final data set, `airbnb`, has 3,331 listings and 15 variables, with no missing values:
+>
+> - **Response:** price and log price.
+> - **Property characteristics:** accommodates, bedrooms, beds, bathrooms, shared bathroom (0/1) and room type (3 levels).
+> - **Location:** neighborhood (25 levels) and distance to downtown.
+> - **Listing and host:** minimum nights, long stay (0/1), superhost (0/1) and number of amenities.
+>
+> Nightly prices range from \$30.44 to \$4,815, with a median of \$252 and a mean of \$312, confirming the right skew. Unusually high prices are kept at this stage and will be examined during EDA and the regression diagnostics. Several predictors measure similar things (accommodates, bedrooms and beds; neighborhood and distance to downtown), so multicollinearity will be checked before the final model is chosen.
+
+\newpage
+
+# Exploratory Data Analysis
+
+## Summary Statistics
+
+```{r summary-table}
+quant_vars <- c("price", "log_price", "accommodates", "bedrooms", "beds",
+                "bathrooms", "dist_downtown", "minimum_nights",
+                "amenities_count")
+
+summary_table <- sapply(quant_vars, function(v) summary_stats(airbnb[[v]])$Value)
+rownames(summary_table) <- summary_stats(airbnb$price)$Statistic
+
+knitr::kable(t(summary_table[-2, ]), align = "r",
+             caption = "Summary Statistics of the Quantitative Variables")
+```
+
+> Price has a mean of \$312 and a median of \$252, with a maximum of \$4,815 and 153 outliers, so it is strongly right-skewed. Log price is much more balanced: its mean (5.47) and median (5.53) are close, and only 38 values are flagged as outliers. The property characteristics are all concentrated at small values: the typical listing accommodates 3 guests with 1 bedroom, 1 bed and 1 bathroom, but each has a long tail of large properties, which accounts for the many outliers flagged for accommodates (300), beds (488), bedrooms (215) and bathrooms (206). Minimum nights has a median of 2 but a mean of 14.2, because of a large group of monthly rentals. The number of amenities is the only roughly symmetric predictor (mean 37.25, median 37).
+
+## Response Variable: Price
+
+```{r price-plots}
+hist_box(airbnb, "price", "Nightly Price ($)")
+```
+
+> Nightly price is strongly right-skewed. Most listings cost under about \$400 per night (Q3 = \$394.86), but a long tail of expensive listings stretches up to \$4,815, with 73 listings above \$1,000. The boxplot flags 153 high outliers. Modeling price directly would likely produce skewed residuals and a variance that grows with price, so a log transformation is considered next.
+
+## Log Price
+
+```{r log-price-plots}
+hist_box(airbnb, "log_price", "log(Price)", fill = "lightgreen")
+```
+
+```{r qq-plots}
+q1 <- ggplot(airbnb, aes(sample = price)) +
+  stat_qq() + stat_qq_line(color = "red") +
+  labs(title = "Normal Q-Q Plot of Price",
+       x = "Theoretical Quantiles", y = "Price ($)") +
+  theme_minimal()
+
+q2 <- ggplot(airbnb, aes(sample = log_price)) +
+  stat_qq() + stat_qq_line(color = "red") +
+  labs(title = "Normal Q-Q Plot of log(Price)",
+       x = "Theoretical Quantiles", y = "log(Price)") +
+  theme_minimal()
+
+q1 + q2
+```
+
+> The log transformation removes most of the skew. The histogram of log price is roughly bell-shaped and centered near 5.5 (about \$250 per night), with the mean (5.47) and median (5.53) close together. The number of boxplot outliers falls from 153 to 38, and they now appear at both ends rather than only at the top. The Q-Q plots show the same improvement: price curves sharply away from the normal reference line, while log price follows it closely except for small departures in the tails. Log price is therefore used as the response variable.
+
+\newpage
+
+## Quantitative Predictors
+
+### Accommodates
+
+```{r accommodates-plots}
+hist_box(airbnb, "accommodates", "Accommodates", binwidth = 1)
+```
+
+> Accommodates is right-skewed. Most listings host 2 to 4 guests (Q1 = 2, Q3 = 4), with the most common value being 2, but some accommodate up to 16. The boxplot flags listings for 8 or more guests as outliers. These are genuine large properties rather than errors, so they are kept.
+
+### Bedrooms
+
+```{r bedrooms-plots}
+hist_box(airbnb, "bedrooms", "Bedrooms", binwidth = 1)
+```
+
+> Most listings have 1 bedroom, and listings with 0 bedrooms are studios. The distribution is right-skewed, and listings with 4 or more bedrooms (up to 15) are flagged as outliers.
+
+### Beds
+
+```{r beds-plots}
+hist_box(airbnb, "beds", "Beds", binwidth = 1)
+```
+
+> Beds follows a similar pattern to bedrooms: most listings have 1 or 2 beds, with a long right tail up to 21 beds. Because the middle half of listings has 1 or 2 beds (IQR = 1), any listing with 4 or more beds is flagged as an outlier (488 listings).
+
+### Bathrooms
+
+```{r bathrooms-plots}
+hist_box(airbnb, "bathrooms", "Bathrooms", binwidth = 0.5)
+```
+
+> Most listings have 1 bathroom, with a second, smaller peak at 2. Values range from 0 to 7.5. Because the middle half of listings has between 1 and 1.5 bathrooms, listings with 2.5 or more bathrooms, as well as the few with 0, are flagged as outliers.
+
+### Distance to Downtown
+
+```{r distance-plots}
+hist_box(airbnb, "dist_downtown", "Distance (km)")
+```
+
+> Most listings are within 6 km of downtown (median 3.33 km, Q3 = 5.81 km), and the distribution is right-skewed. The 45 outliers are listings more than about 12 km away, all in Hyde Park and West Roxbury.
+
+### Minimum Nights
+
+```{r minimum-nights-plots}
+hist_box(airbnb, "minimum_nights", "Minimum Nights")
+```
+
+> Minimum nights has two distinct groups. Half of the listings (1,663) allow 1-night stays, and most others require only a few nights. A second large cluster sits at 29 and 30 nights (772 listings), with smaller groups at longer minimums such as 91 nights. This confirms that the data mix nightly rentals with monthly rentals, which is why the `long_stay` indicator is included.
+
+### Number of Amenities
+
+```{r amenities-plots}
+hist_box(airbnb, "amenities_count", "Amenities")
+```
+
+> The number of amenities is roughly symmetric, centered near 37 (mean 37.25, median 37), with most listings offering between 27 and 47 amenities. Only 3 listings are flagged as outliers.
+
+\newpage
+
+## Categorical Predictors
+
+```{r categorical-counts}
+table(airbnb$room_type)
+table(airbnb$shared_bath)
+table(airbnb$long_stay)
+table(airbnb$superhost)
+```
+
+```{r categorical-boxplots, fig.width = 9, fig.height = 7, out.width = "100%"}
+b1 <- ggplot(airbnb, aes(x = room_type, y = log_price)) +
+  geom_boxplot(fill = "lightblue") +
+  labs(title = "Room Type", x = NULL, y = "log(Price)") +
+  theme_minimal()
+
+b2 <- ggplot(airbnb, aes(x = factor(shared_bath, labels = c("Private", "Shared")),
+                         y = log_price)) +
+  geom_boxplot(fill = "lightblue") +
+  labs(title = "Bathroom", x = NULL, y = "log(Price)") +
+  theme_minimal()
+
+b3 <- ggplot(airbnb, aes(x = factor(long_stay, labels = c("Under 28 nights",
+                                                          "28+ nights")),
+                         y = log_price)) +
+  geom_boxplot(fill = "lightblue") +
+  labs(title = "Minimum Stay", x = NULL, y = "log(Price)") +
+  theme_minimal()
+
+b4 <- ggplot(airbnb, aes(x = factor(superhost, labels = c("No", "Yes")),
+                         y = log_price)) +
+  geom_boxplot(fill = "lightblue") +
+  labs(title = "Superhost", x = NULL, y = "log(Price)") +
+  theme_minimal()
+
+(b1 + b2) / (b3 + b4)
+```
+
+> Each of the categorical predictors shows a clear difference in log price:
+>
+> - **Room type:** entire homes (median \$298) and hotel rooms (\$394) are priced well above private/shared rooms (\$116).
+> - **Bathroom:** listings with a shared bathroom have a median price of \$92, against \$294 for those with a private bathroom.
+> - **Minimum stay:** long-stay listings (28+ nights) have a median of \$137, less than half the \$308 for shorter stays.
+> - **Superhost:** superhosts have a somewhat higher median (\$290) than other hosts (\$226).
+
+```{r neighborhood-boxplot, fig.width = 8, fig.height = 8, out.width = "100%"}
+ggplot(airbnb, aes(x = reorder(neighborhood, log_price, FUN = median),
+                   y = log_price)) +
+  geom_boxplot(fill = "lightblue") +
+  coord_flip() +
+  labs(title = "log(Price) by Neighborhood",
+       x = NULL, y = "log(Price)") +
+  theme_minimal()
+```
+
+> Median prices differ substantially across neighborhoods. Longwood Medical Area, the North End, Downtown and Charlestown have the highest median log prices, while Beacon Hill, Dorchester, Roslindale and Hyde Park have the lowest. Beacon Hill's low position is unexpected for an expensive area. It is driven by a single host who operates 71 of its 180 listings, so it reflects that host's pricing more than the neighborhood. The spread within most neighborhoods is wide, so property characteristics will also matter.
+
+\newpage
+
+## Relationships with log(Price)
+
+```{r scatterplots, fig.width = 9, fig.height = 8, out.width = "100%"}
+scatter_vars <- c("accommodates", "bedrooms", "beds", "bathrooms",
+                  "dist_downtown", "minimum_nights", "amenities_count")
+
+long <- data.frame(log_price = rep(airbnb$log_price, length(scatter_vars)),
+                   stack(airbnb[, scatter_vars]))
+names(long) <- c("log_price", "Value", "Predictor")
+
+ggplot(long, aes(x = Value, y = log_price)) +
+  geom_point(alpha = 0.2, size = 0.8) +
+  geom_smooth(method = "loess", se = FALSE, color = "red") +
+  facet_wrap(~ Predictor, scales = "free_x", ncol = 3) +
+  labs(title = "log(Price) vs Each Quantitative Predictor",
+       x = NULL, y = "log(Price)") +
+  theme_minimal()
+```
+
+> Log price increases with accommodates, bedrooms, beds and bathrooms, and the curves flatten for the largest properties, which suggests the increase in price diminishes as properties get larger (research question 1). Log price decreases slightly with distance from downtown. It drops sharply as minimum nights rises from 1 to about 30 and then levels off, matching the two groups seen above. The relationship with the number of amenities is weakly positive.
+
+```{r interaction-plot}
+ggplot(airbnb, aes(x = accommodates, y = log_price, color = room_type)) +
+  geom_jitter(alpha = 0.3, width = 0.2, size = 0.8) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "log(Price) vs Accommodates by Room Type",
+       x = "Accommodates (guests)", y = "log(Price)", color = "Room Type") +
+  theme_minimal()
+```
+
+> The fitted lines have clearly different slopes: the line for private/shared rooms is much steeper than the line for entire homes. This suggests that the price premium per additional guest differs by room type, which supports including an accommodates-by-room-type interaction (research question 3).
+
+```{r long-stay-interaction, fig.width = 10, fig.height = 4.5, out.width = "100%"}
+airbnb$stay_label <- factor(airbnb$long_stay, labels = c("Under 28 nights",
+                                                         "28+ nights"))
+
+i1 <- ggplot(airbnb, aes(x = accommodates, y = log_price, color = stay_label)) +
+  geom_jitter(alpha = 0.3, width = 0.2, size = 0.8) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "log(Price) vs Accommodates by Minimum Stay",
+       x = "Accommodates (guests)", y = "log(Price)", color = "Minimum Stay") +
+  theme_minimal()
+
+i2 <- ggplot(airbnb, aes(x = room_type, y = log_price, fill = stay_label)) +
+  geom_boxplot() +
+  labs(title = "log(Price) by Room Type and Minimum Stay",
+       x = NULL, y = "log(Price)", fill = "Minimum Stay") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+i1 + i2
+
+airbnb$stay_label <- NULL
+```
+
+> Long-stay listings are priced lower overall, but the gap depends on the size of the listing and its room type, which supports keeping `long_stay` in the model through interactions:
+>
+> - **Accommodates:** the line for long-stay listings is about twice as steep as the line for nightly listings (a slope of 0.20 vs. 0.10 on the log scale). The long-stay discount is therefore largest for small listings and shrinks as the number of guests increases.
+> - **Room type:** long-stay entire homes have a median price of \$186, against \$348 for nightly entire homes. For private/shared rooms the medians are \$67 and \$170, so the long-stay discount is proportionally larger for rooms. Hotel rooms have no long-stay listings.
+>
+> These patterns suggest including `long_stay × accommodates` and `long_stay × room_type` interactions in the regression models.
+
+\newpage
+
+## Correlation Heat Map
+
+```{r heatmap, fig.width = 8, fig.height = 7, out.width = "100%"}
+cor_vars <- c("log_price", "accommodates", "bedrooms", "beds", "bathrooms",
+              "shared_bath", "dist_downtown", "minimum_nights", "long_stay",
+              "superhost", "amenities_count")
+
+cor_mat <- cor(airbnb[, cor_vars])
+cor_df <- as.data.frame(as.table(cor_mat))
+names(cor_df) <- c("Var1", "Var2", "Correlation")
+
+ggplot(cor_df, aes(x = Var1, y = Var2, fill = Correlation)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(Correlation, 2)), size = 3) +
+  scale_fill_gradient2(low = "steelblue", mid = "white", high = "salmon",
+                       midpoint = 0, limits = c(-1, 1)) +
+  labs(title = "Correlation Heat Map", x = NULL, y = NULL) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+> The strongest correlations with log price are shared bathroom (-0.58), accommodates (0.52), long stay (-0.51) and minimum nights (-0.48). Among the predictors, the strongest correlations are between accommodates and beds (0.89), accommodates and bedrooms (0.81), bedrooms and beds (0.80), and minimum nights and long stay (0.78). These pairs measure largely the same thing, which points to possible multicollinearity.
+
+## Variance Inflation Factors
+
+```{r vif}
+full_model <- lm(log_price ~ accommodates + bedrooms + beds + bathrooms +
+                   shared_bath + room_type + neighborhood + dist_downtown +
+                   minimum_nights + long_stay + superhost + amenities_count,
+                 data = airbnb)
+
+vif_vals <- vif(full_model)
+vif_vals[, "GVIF^(1/(2*Df))"] <- round(vif_vals[, "GVIF^(1/(2*Df))"], 2)
+knitr::kable(round(vif_vals, 2), caption = "Variance Inflation Factors (Full Model)")
+```
+
+> For a categorical predictor with several levels, `vif()` reports a generalized VIF (GVIF). The last column, $\text{GVIF}^{1/(2\,Df)}$, puts all predictors on the same scale as the square root of an ordinary VIF, so the usual cutoffs of 5 and 10 correspond to about 2.24 and 3.16.
+>
+> - **Distance to downtown** has the largest value (GVIF = 15.04, adjusted 3.88), above the cutoff of 10. This is because distance and neighborhood measure the same thing: once the neighborhood is known, distance adds little information. Only one of the two should be kept in the final model.
+> - **Accommodates** (6.53, adjusted 2.56) and **beds** (5.25, adjusted 2.29) are above 5, which is moderate multicollinearity, consistent with their correlation of 0.89. Beds is a candidate for removal, since accommodates is one of the main predictors in the research questions.
+> - All other predictors, including neighborhood (adjusted 1.08), are below 5 and are not a concern.
+>
+> These results will guide the variable selection step.
+
+\newpage
+
+# Modeling
+
+## Reference Levels
+
+```{r reference-levels}
+# Neighborhood coefficients are measured relative to Downtown;
+# room type coefficients relative to entire homes
+airbnb$neighborhood <- relevel(airbnb$neighborhood, ref = "Downtown")
+levels(airbnb$room_type)[1]
+levels(airbnb$neighborhood)[1]
+```
+
+> Each categorical predictor enters the model as a set of 0/1 indicators, with one category left out as the reference level. Every coefficient for that predictor is then a price difference compared with the reference category. Downtown is used as the reference neighborhood because it is central, well known and has many listings (273), so the neighborhood coefficients can be read as price differences from Downtown. Entire home/apt remains the reference room type. 
+
+## Train/Test Split
+
+```{r split}
+set.seed(552)
+n <- nrow(airbnb)
+train_index <- sample(1:n, size = round(0.8 * n))
+
+train <- airbnb[train_index, ]
+test  <- airbnb[-train_index, ]
+
+c(train = nrow(train), test = nrow(test))
+```
+
+> The 3,331 listings are randomly split into a training set of 2,665 listings (80%) and a test set of 666 listings (20%), using a fixed seed. All model fitting, variable selection and cross-validation use only the training set. The test set is kept aside to measure the prediction error of the final model on listings it has never seen.
+
+## Full Candidate Model
+
+```{r full-model}
+full_formula <- log_price ~ accommodates + I(accommodates^2) + bedrooms +
+  beds + bathrooms + shared_bath + room_type + neighborhood + dist_downtown +
+  minimum_nights + long_stay + superhost + amenities_count +
+  accommodates:room_type + accommodates:long_stay + room_type:long_stay
+
+full <- lm(full_formula, data = train)
+summary(full)$r.squared
+summary(full)$adj.r.squared
+
+summary(full)
+```
+
+> The full candidate model includes every predictor, a quadratic term in accommodates to allow the price increase to diminish for larger listings (research question 1), and three interactions: accommodates by room type (research question 3), and accommodates by long stay and room type by long stay. It explains about 74% of the variation in log price on the training data ($R^2 = 0.738$, adjusted $R^2 = 0.734$).
+
+## Stepwise Selection
+
+```{r stepwise}
+n_train <- nrow(train)
+null_model <- lm(log_price ~ 1, data = train)
+
+# Backward elimination using AIC
+back_aic <- step(full, direction = "backward", trace = 0)
+
+# Backward elimination using BIC
+back_bic <- step(full, direction = "backward", k = log(n_train), trace = 0)
+
+# Forward selection using BIC, starting from the intercept-only model
+fwd_bic <- step(null_model, scope = list(lower = ~1, upper = full_formula),
+                direction = "forward", k = log(n_train), trace = 0)
+
+# Term labels, written so that a:b and b:a count as the same interaction
+term_list <- function(model) {
+  labels <- attr(terms(model), "term.labels")
+  sapply(strsplit(labels, ":"), function(z) paste(sort(z), collapse = ":"))
+}
+
+# Terms removed from the full model by each procedure
+setdiff(term_list(full), term_list(back_aic))
+setdiff(term_list(full), term_list(back_bic))
+setdiff(term_list(full), term_list(fwd_bic))
+
+# Do backward and forward BIC select the same model?
+setequal(term_list(back_bic), term_list(fwd_bic))
+
+formula(back_aic)
+formula(back_bic)
+```
+
+```{r room-type-test}
+# Partial F-test: does room type (with its interaction) add to the AIC model?
+no_room <- update(back_aic, . ~ . - accommodates:room_type - room_type)
+anova(no_room, back_aic)
+
+# Room type and shared bathrooms overlap strongly
+table(train$room_type, train$shared_bath)
+```
+
+> Three stepwise procedures were run on the training data.
+>
+> - **Backward AIC** removes only one term, the room type by long stay interaction, leaving 40 coefficients.
+> - **Backward BIC** uses a much larger penalty per coefficient ($\log(2665) = 7.89$ instead of 2) and removes four terms: beds, room type, accommodates by room type, and room type by long stay. This leaves 35 coefficients.
+> - **Forward BIC**, starting from the intercept-only model, arrives at exactly the same model as backward BIC.
+>
+> Both procedures keep neighborhood and distance to downtown, the quadratic accommodates term, and the accommodates by long stay interaction.
+
+## Lasso
+
+```{r lasso}
+# Model matrix of all candidate terms (factors become 0/1 indicators);
+# the column for hotel rooms x long stay is dropped because it is all zeros
+x_train <- model.matrix(full_formula, data = train)[, -1]
+x_train <- x_train[, colSums(x_train != 0) > 0]
+y_train <- train$log_price
+
+set.seed(552)
+lasso_cv <- cv.glmnet(x_train, y_train, alpha = 1, nfolds = 10)
+plot(lasso_cv)
+
+lasso_cv$lambda.min
+lasso_cv$lambda.1se
+
+lasso_coef <- coef(lasso_cv, s = "lambda.1se")
+zero_terms <- rownames(lasso_coef)[as.vector(lasso_coef) == 0]
+zero_terms
+```
+
+> The lasso adds a penalty on the size of the coefficients, which shrinks them toward zero and sets some exactly to zero. The tuning parameter $\lambda$ was chosen by 10-fold cross-validation on the training data, giving $\lambda_{\min} = 0.0004$ and $\lambda_{1se} = 0.0066$. Using $\lambda_{1se}$, the more heavily penalized choice whose error is within one standard error of the minimum, the lasso sets these coefficients to zero: beds, six neighborhood indicators (Back Bay, Bay Village, Leather District, Roslindale, South Boston and West End, meaning their prices are treated as equal to Downtown's), and accommodates by hotel room. Unlike stepwise selection, the lasso treats each indicator separately, so it can drop some neighborhoods while keeping others.
+
+## Cross-Validation Comparison
+
+All candidate models are compared on the training data with the same 10 folds. For each fold, the model is fitted on the other nine folds and used to predict the held-out fold.
+
+```{r cv-compare}
+set.seed(552)
+folds <- sample(rep(1:10, length.out = n_train))
+
+cv_error <- function(model_formula = NULL, lasso = FALSE) {
+  pred_err <- numeric(n_train)
+  for (k in 1:10) {
+    test_idx <- which(folds == k)
+    if (lasso) {
+      fit <- cv.glmnet(x_train[-test_idx, ], y_train[-test_idx], alpha = 1,
+                       nfolds = 10)
+      pred <- predict(fit, newx = x_train[test_idx, ], s = "lambda.1se")
+    } else {
+      fit <- lm(model_formula, data = train[-test_idx, ])
+      pred <- predict(fit, newdata = train[test_idx, ])
+    }
+    pred_err[test_idx] <- y_train[test_idx] - pred
+  }
+  c(PRESS = sum(pred_err^2), RMSE = sqrt(mean(pred_err^2)))
+}
+
+set.seed(552)
+cv_results <- rbind(
+  "Full model"   = cv_error(formula(full)),
+  "Backward AIC" = cv_error(formula(back_aic)),
+  "Backward BIC" = cv_error(formula(back_bic)),
+  "Forward BIC"  = cv_error(formula(fwd_bic)),
+  "Lasso (1se)"  = cv_error(lasso = TRUE))
+
+n_terms <- c(length(coef(full)) - sum(is.na(coef(full))),
+             length(coef(back_aic)) - sum(is.na(coef(back_aic))),
+             length(coef(back_bic)) - sum(is.na(coef(back_bic))),
+             length(coef(fwd_bic)) - sum(is.na(coef(fwd_bic))),
+             sum(as.vector(lasso_coef) != 0)) - 1
+
+knitr::kable(cbind(Coefficients = n_terms, round(cv_results, 4)),
+             caption = "10-Fold Cross-Validation on the Training Data")
+```
+
+> The backward AIC model has the lowest cross-validated prediction error (RMSE = 0.3847 on the log scale), followed closely by the full model (0.3851) and the BIC model (0.3864). The lasso has the highest error (0.3939), because the $\lambda_{1se}$ penalty shrinks the coefficients more than is optimal for prediction here. The differences between the stepwise models are very small, under 0.5%.
+>
+> **The backward AIC model is chosen.** It has the lowest cross-validated error, and it keeps room type and the accommodates by room type interaction, which are needed to answer research questions 1 and 3. The BIC model drops room type, but the partial F-test shows that room type and its interaction add significantly to the model ($F = 6.99$ on 4 and 2624 df, $p < 0.001$). BIC removes it because room type overlaps heavily with shared bathrooms: in the training data, no entire homes or hotel rooms have shared bathrooms, while 517 of the 740 private/shared rooms do.
+>
+> The AIC model still contains beds and both neighborhood and distance to downtown, which the VIFs flagged as overlapping. This does not harm prediction, but the coefficients of these variables have inflated standard errors and should be interpreted with caution. The chosen model will next be checked with diagnostic plots and evaluated on the test set.
+
+\newpage
+
+## Model Diagnostics
+
+The diagnostics are carried out on the chosen model, the backward AIC model fitted to the training data.
+
+```{r final-model}
+final_model <- back_aic
+summary(final_model)$r.squared
+summary(final_model)$adj.r.squared
+```
+
+### Diagnostic Plots
+
+```{r diagnostic-plots, fig.width = 9, fig.height = 8, out.width = "100%"}
+par(mfrow = c(2, 2))
+plot(final_model)
+par(mfrow = c(1, 1))
+```
+
+> - **Residuals vs Fitted:** the residuals are centered around zero and the red line is nearly flat, so the linearity assumption is reasonable. The spread is roughly the same across fitted values, with no fanning out.
+> - **Normal Q-Q:** the points follow the reference line through the middle and lower part of the distribution, but curve upward in the upper tail. The residuals are therefore somewhat right-skewed, caused by a small number of listings priced far above what the model predicts.
+> - **Scale-Location:** the red line is roughly flat, which supports the constant variance assumption. The log transformation of price has removed the increasing spread that raw prices would show.
+> - **Residuals vs Leverage:** no listing comes close to a Cook's distance of 0.5. The highest-leverage points (about 0.33) are the three Leather District listings: they are the only listings in that neighborhood, so each has a large say in its coefficient.
+>
+> Overall, the assumptions are reasonably met. The main departure is the heavy upper tail of the residuals. With 2,665 listings, the t-tests and confidence intervals are fairly robust to this.
+
+### Multicollinearity
+
+```{r final-vif}
+# With interactions in the model, VIFs are computed per predictor,
+# combining each predictor with the interactions it appears in
+final_vif <- vif(final_model, type = "predictor")
+knitr::kable(round(final_vif[, 1:3], 2),
+             caption = "Variance Inflation Factors (Chosen Model)")
+```
+
+> Because the model contains interactions and a quadratic term, the VIFs are computed per predictor (`type = "predictor"`), which groups each predictor with the terms built from it. The adjusted values in the last column are compared with 3.16, the equivalent of a VIF of 10.
+>
+> - **Distance to downtown** is the only predictor above this cutoff (adjusted 3.83, GVIF 14.68), because it overlaps with neighborhood.
+> - **Accommodates** has a large GVIF (96.76), but on 8 degrees of freedom, because it is combined with its square and its interactions. Its adjusted value is only 1.33, so this is the expected structure of the model rather than a problem.
+> - **Beds** shows moderate overlap (adjusted 2.44), and all other predictors are low.
+>
+> The remaining multicollinearity is between distance and neighborhood. It does not affect predictions, but it makes the individual neighborhood and distance coefficients less precise. This matters for research question 2, where the neighborhood coefficients are interpreted.
+
+### Outliers and Influential Listings
+
+```{r influence}
+n_fit <- nobs(final_model)
+p_fit <- length(coef(final_model))
+
+stud_resid <- rstudent(final_model)
+leverage   <- hatvalues(final_model)
+cooks_d    <- cooks.distance(final_model)
+
+# Number of listings beyond the usual cutoffs
+c("|studentized residual| > 2" = sum(abs(stud_resid) > 2),
+  "|studentized residual| > 3" = sum(abs(stud_resid) > 3),
+  "leverage > 2p/n"            = sum(leverage > 2 * p_fit / n_fit),
+  "Cook's D > 4/n"             = sum(cooks_d > 4 / n_fit),
+  "Cook's D > 0.5"             = sum(cooks_d > 0.5))
+
+# The 10 most influential listings
+top <- order(cooks_d, decreasing = TRUE)[1:10]
+knitr::kable(data.frame(Price     = train$price[top],
+                        Predicted = round(exp(fitted(final_model)[top]), 0),
+                        Room      = train$room_type[top],
+                        Guests    = train$accommodates[top],
+                        Area      = train$neighborhood[top],
+                        Resid     = round(stud_resid[top], 2),
+                        Leverage  = round(leverage[top], 3),
+                        CooksD    = round(cooks_d[top], 4),
+                        row.names = NULL),
+             caption = "Most Influential Listings in the Training Data")
+```
+
+```{r cooks-plot}
+plot(final_model, which = 4)
+abline(h = 4 / n_fit, lty = 2, col = "red")
+```
+
+> - **Outliers:** 109 listings (4.1%) have studentized residuals beyond $\pm 2$, close to the 5% expected by chance. However, 23 exceed $\pm 3$, more than expected, which matches the heavy upper tail in the Q-Q plot.
+> - **Influence:** 152 listings exceed the Cook's distance cutoff of $4/n = 0.0015$, but none comes close to 0.5. The largest is only 0.045, so no single listing dominates the fit.
+> - **Most unusual listings:** the largest residual is a private room in Allston priced at \$4,815, which the model predicts at \$232. This is very likely a data entry error or a placeholder price. Other examples include a North End entire home priced at \$1,454 against a prediction of \$132. The three Leather District listings appear because of their high leverage.
+
+### Sensitivity Analysis
+
+```{r sensitivity}
+# Refit the model without the listings with Cook's D > 4/n
+reduced_model <- update(final_model, data = train[cooks_d <= 4 / n_fit, ])
+
+key_terms <- c("accommodates", "I(accommodates^2)", "shared_bath",
+               "room_typePrivate/shared room", "long_stay",
+               "accommodates:room_typePrivate/shared room",
+               "accommodates:long_stay")
+knitr::kable(round(cbind("All listings"       = coef(final_model)[key_terms],
+                         "Without influential" = coef(reduced_model)[key_terms]), 4),
+             caption = "Key Coefficients With and Without Influential Listings")
+```
+
+> To check whether the influential listings drive the conclusions, the model was refitted without the 152 listings with Cook's distance above $4/n$ (5.7% of the training data). The coefficients for accommodates, its square, long stay and both interactions barely change. The coefficients for shared bathroom and private/shared room shift in opposite directions, from -0.415 to -0.325 and from -0.241 to -0.315. Because these two variables overlap, their combined effect for a private room with a shared bathroom stays about the same (-0.656 vs. -0.640). The conclusions therefore do not depend on the influential listings, and all listings are kept. ($R^2$ rises to 0.81 in the refit, but that is expected when poorly fitting listings are removed and is not a reason to drop them.)
+
+## Test Set Performance
+
+```{r test-performance}
+test_pred <- predict(final_model, newdata = test)
+test_err  <- test$log_price - test_pred
+
+test_rmse <- sqrt(mean(test_err^2))
+test_r2   <- 1 - sum(test_err^2) / sum((test$log_price - mean(test$log_price))^2)
+
+# Typical error in dollars: predicted price exp(prediction) vs actual price
+median_pct_err <- median(abs(exp(test_pred) / test$price - 1)) * 100
+
+knitr::kable(data.frame(
+  Measure = c("Training RMSE", "10-fold CV RMSE (training)", "Test RMSE",
+              "Test R-squared", "Median absolute % error (test)"),
+  Value = round(c(sqrt(mean(resid(final_model)^2)),
+                  cv_results["Backward AIC", "RMSE"],
+                  test_rmse, test_r2, median_pct_err), 4)),
+  caption = "Prediction Performance of the Chosen Model")
+```
+
+```{r test-plot}
+ggplot(data.frame(actual = test$log_price, predicted = test_pred),
+       aes(x = predicted, y = actual)) +
+  geom_point(alpha = 0.4) +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  labs(title = "Actual vs Predicted log(Price) on the Test Set",
+       x = "Predicted log(Price)", y = "Actual log(Price)") +
+  theme_minimal()
+```
+
+> The chosen model predicts the 666 held-out test listings about as well as it fits the training data. The test RMSE (0.387) is very close to the 10-fold CV estimate (0.385) and the training RMSE (0.379), so the model is not overfitting. It explains 73% of the variation in log price in the test set ($R^2 = 0.731$), similar to the 74% in the training data. In dollar terms, half of the predicted prices are within 23% of the actual price. The plot shows the test listings scattered evenly around the line of perfect prediction, with a few listings priced well above their predictions, as in the training data.
+
+\newpage
+
+# Research Questions
+
+The research questions are answered with three nested models. The train/test split was used to select and validate a model for prediction. The research questions are about estimating effects rather than predicting, and Models 1 to 3 were specified in the proposal rather than chosen from the data, so they are fitted to all 3,331 listings. Using the full data gives more precise estimates and narrower confidence intervals, especially for the smaller neighborhoods. Beds and distance to downtown are left out because the VIFs showed that they duplicate accommodates and neighborhood, which would make the coefficients of interest unstable. Long stay (with its interaction with accommodates), minimum nights, superhost status and the number of amenities are included in every model as control variables, so that the property and location effects are not confused with differences in rental type or listing quality.
+
+```{r pct-helper}
+# Coefficients as percentage changes in price, with 95% confidence intervals:
+# a coefficient b on the log scale means price is multiplied by exp(b)
+pct_table <- function(model, terms) {
+  est <- coef(model)[terms]
+  ci  <- confint(model)[terms, ]
+  data.frame(Estimate  = round(est, 4),
+             p_value   = round(summary(model)$coefficients[terms, 4], 4),
+             Pct       = round(100 * (exp(est) - 1), 1),
+             Pct_lower = round(100 * (exp(ci[, 1]) - 1), 1),
+             Pct_upper = round(100 * (exp(ci[, 2]) - 1), 1))
+}
+
+controls <- "+ long_stay + accommodates:long_stay + minimum_nights + superhost + amenities_count"
+```
+
+## Research Question 1: Property Characteristics (Model 1)
+
+```{r model-1}
+# Model 1 with a linear accommodates term, then with a quadratic term
+model1_linear <- lm(as.formula(paste(
+  "log_price ~ accommodates + bedrooms + bathrooms + shared_bath + room_type",
+  controls)), data = airbnb)
+model1 <- update(model1_linear, . ~ . + I(accommodates^2))
+
+# Does the per-guest effect diminish? Linear vs quadratic accommodates
+anova(model1_linear, model1)
+
+# Quadratic terms for bedrooms and bathrooms as well
+anova(model1, update(model1, . ~ . + I(bedrooms^2) + I(bathrooms^2)))
+
+summary(model1)$r.squared
+summary(model1)$adj.r.squared
+
+m1_terms <- c("bedrooms", "bathrooms", "shared_bath",
+              "room_typePrivate/shared room", "room_typeHotel room")
+knitr::kable(pct_table(model1, m1_terms),
+             caption = "Model 1: Percentage Change in Price")
+```
+
+```{r per-guest-model1}
+# Percentage change in price from adding one guest, for a nightly listing:
+# going from a to a + 1 guests changes log price by b1 + b2 * (2a + 1)
+b <- coef(model1)
+guests <- c(1, 2, 4, 6, 8)
+per_guest <- b["accommodates"] + b["I(accommodates^2)"] * (2 * guests + 1)
+knitr::kable(data.frame(From_guests = guests, To_guests = guests + 1,
+                        Pct_change = round(100 * (exp(per_guest) - 1), 1)),
+             caption = "Model 1: Price Change per Additional Guest")
+```
+
+> Model 1 explains about 66% of the variation in log price ($R^2 = 0.661$, adjusted $R^2 = 0.660$) using property characteristics and the control variables. Because the response is log price, each coefficient $b$ is converted to a percentage change in price, $100(e^{b} - 1)\%$, holding the other variables constant.
+>
+> - **Guests:** the quadratic accommodates term is highly significant ($F = 79.81$, $p < 0.001$), so **the price increase per additional guest diminishes for larger listings**. For a nightly listing, going from 1 to 2 guests raises the price by about 10.1%, from 2 to 3 by 8.8%, from 4 to 5 by 6.2%, and from 8 to 9 by only 1.3%.
+> - **Bathrooms:** each additional bathroom is associated with a 26.2% higher price (95% CI: 22.4% to 30.2%).
+> - **Bedrooms:** once the number of guests and bathrooms is held constant, an extra bedroom has no significant effect in Model 1 (1.9%, CI: -0.4% to 4.2%, $p = 0.11$). Capacity already captures most of the size of a listing.
+> - **Shared bathroom:** listings with a shared bathroom are about 41.8% cheaper (CI: -45.4% to -38.1%).
+> - **Room type:** compared with an entire home, a private/shared room is about 21.2% cheaper (CI: -25.6% to -16.6%), on top of the shared-bathroom discount, and a hotel room is about 23.3% more expensive (CI: 9.6% to 38.8%).
+>
+> Quadratic terms for bedrooms and bathrooms were also tested. They are statistically significant ($F = 14.89$, $p < 0.001$) but reduce the residual sum of squares by less than 1%, so the simpler linear terms are kept for these two variables to keep their effects easy to interpret.
+
+## Research Question 2: Neighborhood Differences (Model 2)
+
+```{r model-2}
+model2 <- update(model1, . ~ . + neighborhood)
+
+# Does location add to the property characteristics?
+anova(model1, model2)
+
+data.frame(Model = c("Model 1", "Model 2"),
+           R2     = round(c(summary(model1)$r.squared,
+                            summary(model2)$r.squared), 4),
+           Adj_R2 = round(c(summary(model1)$adj.r.squared,
+                            summary(model2)$adj.r.squared), 4))
+```
+
+```{r neighborhood-effects}
+# Neighborhood differences from Downtown, in percent and in dollars.
+# Dollar differences use a typical listing: an entire home for 3 guests with
+# 1 bedroom and 1 private bathroom, a 2-night minimum, 37 amenities, no superhost
+nb_terms <- grep("^neighborhood", names(coef(model2)), value = TRUE)
+nb_table <- pct_table(model2, nb_terms)
+
+typical <- data.frame(accommodates = 3, bedrooms = 1, bathrooms = 1,
+                      shared_bath = 0,
+                      room_type = factor("Entire home/apt",
+                                         levels = levels(airbnb$room_type)),
+                      long_stay = 0, minimum_nights = 2, superhost = 0,
+                      amenities_count = 37,
+                      neighborhood = factor("Downtown",
+                                            levels = levels(airbnb$neighborhood)))
+downtown_price <- exp(predict(model2, newdata = typical))
+downtown_price
+
+nb_table$Dollar_diff <- round(downtown_price * (exp(nb_table$Estimate) - 1), 0)
+rownames(nb_table) <- sub("neighborhood", "", rownames(nb_table))
+knitr::kable(nb_table[order(nb_table$Estimate), ],
+             caption = "Model 2: Neighborhood Differences from Downtown")
+```
+
+> Adding neighborhood to Model 1 improves the fit substantially. The partial F-test is highly significant ($F = 36.19$ on 24 and 3294 df, $p < 0.001$), and adjusted $R^2$ rises from 0.660 to 0.729. **Location explains about 7 percentage points of additional variation in price** beyond property characteristics.
+>
+> The table compares each neighborhood with Downtown for otherwise identical listings. Dollar differences are calculated for a typical listing, which the model prices at \$393 per night in Downtown.
+>
+> - **Outer neighborhoods are much cheaper:** comparable listings cost about 34% to 47% less than in Downtown in Hyde Park (-47.0%, about \$185 less per night), Roslindale (-45.5%, \$179), Dorchester (-44.3%, \$174), Roxbury (-43.2%, \$170), Mission Hill, East Boston, Mattapan, Jamaica Plain, West Roxbury, Brighton and Allston.
+> - **Central neighborhoods are close to Downtown:** Back Bay (-8.2%), Fenway (-9.3%) and Bay Village (-13.5%) are slightly cheaper, and the South End is not significantly different from Downtown.
+> - **Two neighborhoods are more expensive than Downtown:** Chinatown (+22.6%, about \$89 more) and South Boston Waterfront (+18.3%, about \$72 more).
+> - **Small neighborhoods are imprecise:** Leather District, Longwood Medical Area and the West End are not significantly different from Downtown, but their confidence intervals are very wide (for Leather District, -45.9% to +30.5%) because they have few listings.
+> - Beacon Hill is 19.5% cheaper than Downtown, which partly reflects the single large host who operates many of its listings.
+
+### Interactive Neighborhood Map
+
+The neighborhood results from Model 2 can also be explored on an interactive map: **[Boston Neighborhood Price Map](https://vincent-attakpah.github.io/Boston-airbnb-price-analysis/)**.
+
+> Each listing is shown as a dot, colored by its neighborhood's estimated price difference from Downtown. Clicking a neighborhood on the map or in the ranked list shows its percentage and dollar difference from Downtown, the 95% confidence interval, the p-value and the number of listings. Neighborhoods that are not significantly different from Downtown can be greyed out, and the differences can be shown in percent or in dollars per night for a typical listing.
+
+## Research Question 3: Interaction Effects (Model 3)
+
+```{r model-3}
+model3 <- update(model2, . ~ . + accommodates:room_type)
+
+# Does the per-guest premium differ by room type?
+anova(model2, model3)
+
+summary(model3)$adj.r.squared
+
+knitr::kable(pct_table(model3, c("accommodates:room_typePrivate/shared room",
+                                 "accommodates:room_typeHotel room")),
+             caption = "Model 3: Interaction Terms")
+```
+
+```{r per-guest-model3}
+# Percentage change from adding one guest (2 to 3 guests), nightly listings
+b3 <- coef(model3)
+base_effect <- b3["accommodates"] + b3["I(accommodates^2)"] * (2 * 2 + 1)
+room_effect <- c(unname(base_effect),
+                 unname(base_effect + b3["accommodates:room_typePrivate/shared room"]))
+names(room_effect) <- c("Entire home/apt", "Private/shared room")
+
+# Typical (median) price of each room type
+median_price <- tapply(airbnb$price, airbnb$room_type, median)[names(room_effect)]
+
+knitr::kable(data.frame(Pct_per_guest   = round(100 * (exp(room_effect) - 1), 1),
+                        Median_price    = round(median_price, 0),
+                        Dollar_per_guest = round(median_price *
+                                                   (exp(room_effect) - 1), 0)),
+             caption = "Model 3: Premium for a Third Guest by Room Type")
+```
+
+> The accommodates by room type interaction is significant ($F = 9.82$ on 2 and 3292 df, $p < 0.001$). **The price premium per additional guest is larger for private/shared rooms than for entire homes.** The interaction coefficient (0.0593) means each extra guest raises the price of a private/shared room by about 6.1% more than it raises the price of an entire home (CI: 3.1% to 9.2%). For a nightly listing going from 2 to 3 guests, the price rises by about 9.4% for an entire home and 16.1% for a private/shared room. The hotel room interaction is not significant ($p = 0.12$), as there are only 55 hotel rooms.
+>
+> **Is the difference large enough to matter in practice?** Only modestly. In dollar terms the per-guest premium is actually larger for entire homes (about \$28 for a third guest, at the median entire-home price of \$298) than for private/shared rooms (about \$19, at the median of \$116), because entire homes start from a higher price. The interaction also raises adjusted $R^2$ only slightly, from 0.7288 to 0.7303. The difference is real and statistically clear, but small compared with the effects of room type, bathrooms and location.
+>
+> In Model 3, the main effect of private/shared room describes a listing with 0 guests because of the interaction, so it is not interpreted on its own.
+
+## Final Model
+
+```{r final-comparison}
+# For a fair comparison, Model 3 is refitted to the training data only and
+# evaluated with the same CV folds and test set as the AIC model
+model3_train <- update(model3, data = train)
+test_rmse_m3 <- sqrt(mean((test$log_price - predict(model3_train, newdata = test))^2))
+
+knitr::kable(data.frame(
+  Model = c("Backward AIC (selected for prediction)", "Model 3"),
+  Coefficients = c(length(coef(final_model)) - 1, length(coef(model3_train)) - 1),
+  CV_RMSE   = round(c(cv_results["Backward AIC", "RMSE"],
+                      unname(cv_error(formula(model3))["RMSE"])), 4),
+  Test_RMSE = round(c(test_rmse, test_rmse_m3), 4)),
+  caption = "Prediction Error of the AIC Model and Model 3")
+
+final_vif3 <- vif(model3, type = "predictor")
+knitr::kable(round(final_vif3[, 1:3], 2), caption = "Variance Inflation Factors (Model 3)")
+```
+
+```{r model3-diagnostics, fig.width = 9, fig.height = 8, out.width = "100%"}
+par(mfrow = c(2, 2))
+plot(model3)
+par(mfrow = c(1, 1))
+```
+
+> To compare prediction accuracy fairly, Model 3 was refitted to the training data only and evaluated in the same way as the AIC model. It predicts almost as well: its cross-validated RMSE is 0.3881 compared with 0.3847, and its test RMSE is 0.3892 compared with 0.3870, a difference of under 1%. It uses fewer coefficients (38 instead of 40) and has no remaining multicollinearity: with beds and distance to downtown removed, every adjusted GVIF is at most 2.00, and the neighborhood value falls to 1.02. Its diagnostic plots, for the fit to all listings, are essentially the same as those of the AIC model, with reasonable linearity and constant variance and a heavier upper tail of residuals.
+>
+> **Model 3 is therefore recommended as the final model.** It answers all three research questions, its coefficients are stable and interpretable, and it gives up almost nothing in prediction accuracy. The AIC model serves as a benchmark showing that the simpler model is not missing important predictive information.
+>
+> In the final model fitted to all listings, holding the other variables constant, each additional bathroom is associated with an 18.7% higher price (CI: 15.4% to 22.1%) and each additional bedroom with a 9.2% higher price (CI: 6.8% to 11.6%), while a shared bathroom lowers the price by 34.6% (CI: -38.3% to -30.7%). Superhosts charge about 7.5% more, and each additional amenity adds about 0.3%. Bedrooms become significant once neighborhood is included, because larger homes tend to be in the cheaper outer neighborhoods, which hid their effect in Model 1.

@@ -25,3 +25,32 @@ The final model predicts held-out listings with a test RMSE of 0.389 on the log 
 ## The map
 
 `index.html` is a self-contained interactive map of the neighborhood results from Model 2. Each listing is a dot colored by its neighborhood's estimated price difference from Downtown. Clicking a neighborhood shows its percentage and dollar difference, 95% confidence interval, p-value and number of listings.
+
+## Repository contents
+
+| File | Description |
+|---|---|
+| [`analysis/airbnb_price_analysis.pdf`](analysis/airbnb_price_analysis.pdf) | The full report: data preparation, exploratory analysis, model selection, diagnostics and answers to the research questions |
+| [`analysis/airbnb_price_analysis.Rmd`](analysis/airbnb_price_analysis.Rmd) | The R Markdown source for the report |
+| [`analysis/listings.csv`](analysis/listings.csv) | Raw Boston listings data from Inside Airbnb |
+| [`index.html`](index.html) | The interactive neighborhood price map |
+
+## Methods
+
+- Data cleaning in base R: price parsing, bathroom counts and shared-bathroom indicators extracted from text, distance to downtown from coordinates, and a long-stay indicator for listings requiring 28 or more nights.
+- Exploratory analysis: summary statistics, distributions, a correlation heat map and variance inflation factors.
+- Model selection on an 80/20 train/test split: backward and forward stepwise selection with AIC and BIC, and the lasso with a cross-validated penalty, compared by 10-fold cross-validation.
+- Diagnostics: residual plots, influence measures (leverage and Cook's distance) and a sensitivity analysis without influential listings.
+- Inference: three nested models, compared with partial F-tests, with coefficients reported as percentage changes with 95% confidence intervals.
+
+## Reproducing the analysis
+
+Open `analysis/airbnb_price_analysis.Rmd` in RStudio and knit it. It reads `listings.csv` from the same folder and needs the R packages `ggplot2`, `patchwork`, `car` and `glmnet`:
+
+```r
+install.packages(c("ggplot2", "patchwork", "car", "glmnet", "rmarkdown"))
+```
+
+## Data source and license
+
+The listings data come from [Inside Airbnb](https://insideairbnb.com/), which publishes them under a [Creative Commons Attribution 4.0 International License](https://creativecommons.org/licenses/by/4.0/).
