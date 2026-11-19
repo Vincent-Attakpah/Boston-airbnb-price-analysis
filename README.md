@@ -12,15 +12,15 @@ An ST 552 project by Peter Sasu and Vincent Johnson Attakpah that uses multiple 
 
 ## Data
 
-Boston listings from [Inside Airbnb](https://insideairbnb.com/get-the-data/). After removing listings without a price or with missing predictor values, the analysis uses 3,331 listings. The response is log nightly price.
+Boston listings from [Inside Airbnb](https://insideairbnb.com/get-the-data/). After removing listings without a price or with missing predictor values, the analysis uses 3,422 listings. The response is log nightly price.
 
 ## Main findings
 
-- **Property characteristics:** the price increase per additional guest diminishes for larger listings, from about 10% (1 to 2 guests) to about 1% (8 to 9 guests). Each additional bathroom adds about 26%, a shared bathroom lowers the price by about 42%, and private or shared rooms are about 21% cheaper than entire homes.
-- **Location:** neighborhood adds about 7 percentage points to adjusted R² (0.660 to 0.729). Compared with Downtown, comparable listings cost 34% to 47% less in the outer neighborhoods, while Chinatown and South Boston Waterfront are about 18% to 23% more expensive.
-- **Interaction:** an extra guest raises the price of a private or shared room by about 16%, against about 9% for an entire home. In dollars, the premium is still larger for entire homes because they start from a higher price.
+- **Property characteristics:** the price increase per additional guest diminishes for larger listings, from about 10% (1 to 2 guests) to under 2% (8 to 9 guests). Each additional bathroom adds about 25%, a shared bathroom lowers the price by about 42%, and private or shared rooms are about 16% cheaper than entire homes.
+- **Location:** neighborhood adds about 7 percentage points to adjusted R² (0.658 to 0.728). Compared with Downtown, comparable listings cost 34% to 46% less in the outer neighborhoods, while Chinatown and South Boston Waterfront are about 18% to 22% more expensive.
+- **Interaction:** an extra guest raises the price of a private or shared room by about 15%, against about 10% for an entire home. In dollars, the premium is still larger for entire homes because they start from a higher price.
 
-The final model predicts held-out listings with a test RMSE of 0.389 on the log scale, close to its cross-validated error.
+The final model explains 73% of the variation in log price and predicts held-out listings with a test RMSE of 0.391 on the log scale, close to its cross-validated error.
 
 ## The map
 
